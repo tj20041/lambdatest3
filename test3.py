@@ -60,15 +60,23 @@ class TokenBucketRateLimiter:
 
         logger.info(f"Evaluating client '{client_id}'. Elapsed time since last call: {delta_seconds}s")
 
-        # Refill tokens according to elapsed duration
-        refill_tokens = delta_seconds * policy.refill_rate_per_sec
-        client_state.tokens_remaining = min(policy.capacity, client_state.tokens_remaining + refill_tokens)
-        client_state.last_refill_timestamp = current_ts
-
-        # Advanced burst pressure calculations
-        # FAILS HERE: When two requests arrive in the exact same microsecond timestamp (current_ts == last_refill_timestamp),
-        # delta_seconds is 0.0, triggering ZeroDivisionError during throughput velocity calculations
-        instantaneous_pressure = (tokens_to_consume / delta_seconds) * (policy.capacity / policy.burst_allowance)
+        # Refill tokens according to elapsed duration.
+        # Guard against delta_seconds <= 0.0: this occurs when two requests arrive
+        # with identical timestamps (e.g. frozen test timestamps, or high-concurrency
+        # warm Lambda containers resolving to the same microsecond tick). In that case
+        # no real time has elapsed, so no tokens should be refilled and
+        # last_refill_timestamp should not advance. instantaneous_pressure is set to
+        # None (serialised as JSON null) to signal a fully-saturated burst condition.
+        if delta_seconds > 0.0:
+            refill_tokens = delta_seconds * policy.refill_rate_per_sec
+            client_state.tokens_remaining = min(policy.capacity, client_state.tokens_remaining + refill_tokens)
+            client_state.last_refill_timestamp = current_ts
+            raw_pressure = (tokens_to_consume / delta_seconds) * (policy.capacity / policy.burst_allowance)
+            # Guard against inf before rounding so json.dumps does not raise ValueError
+            instantaneous_pressure: Optional[float] = None if math.isinf(raw_pressure) else round(raw_pressure, 2)
+        else:
+            # No elapsed time — skip refill, signal saturated burst pressure as None
+            instantaneous_pressure = None
 
         if client_state.tokens_remaining >= tokens_to_consume:
             client_state.tokens_remaining -= tokens_to_consume
@@ -76,7 +84,7 @@ class TokenBucketRateLimiter:
             return True, {
                 "allowed": True,
                 "remaining": round(client_state.tokens_remaining, 2),
-                "instantaneous_pressure": round(instantaneous_pressure, 2)
+                "instantaneous_pressure": instantaneous_pressure
             }
         else:
             retry_after_sec = (tokens_to_consume - client_state.tokens_remaining) / policy.refill_rate_per_sec
@@ -84,7 +92,7 @@ class TokenBucketRateLimiter:
                 "allowed": False,
                 "remaining": round(client_state.tokens_remaining, 2),
                 "retry_after_seconds": math.ceil(retry_after_sec),
-                "instantaneous_pressure": round(instantaneous_pressure, 2)
+                "instantaneous_pressure": instantaneous_pressure
             }
 
 # Instantiate rate limiter in global scope across Lambda warm invocations
@@ -96,22 +104,18 @@ rate_limiter = TokenBucketRateLimiter()
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     logger.info("Received request authorization query")
 
-    # Fixed timestamp simulating concurrent execution in identical event loop ticks
-    frozen_epoch_now = 1715000000.125000
-
-    # Seed client in state cache with identical timestamp to force delta_seconds = 0.0
-    client_key = "api_key_live_992147102"
-    rate_limiter.state_store[client_key] = ClientSessionState(
-        tokens_remaining=10.0,
-        last_refill_timestamp=frozen_epoch_now,
-        request_history=collections.deque(maxlen=100)
-    )
+    # Use real wall-clock time so that delta_seconds reflects genuine elapsed
+    # duration and the token refill mechanism operates correctly.
+    # The previously hard-coded frozen_epoch_now literal has been removed — it
+    # was a test artefact that deterministically forced delta_seconds = 0.0 on
+    # every invocation, causing the ZeroDivisionError seen in production logs.
+    current_ts = time.time()
 
     simulated_gateway_request = {
         "path": "/v1/market/quote",
         "httpMethod": "GET",
         "headers": {
-            "x-api-key": client_key,
+            "x-api-key": "api_key_live_992147102",
             "x-client-tier": "TIER_STANDARD"
         },
         "queryStringParameters": {
@@ -125,13 +129,22 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
     logger.info(f"Authenticating request for tenant: {api_key} on tier: {tier}")
 
-    # Invoke consumption where delta_seconds between last_refill and current_ts is exactly 0.0
-    allowed, metadata = rate_limiter.consume(
-        client_id=api_key,
-        client_tier=tier,
-        tokens_to_consume=1.0,
-        current_ts=frozen_epoch_now
-    )
+    # Defensive wrapper: catch any residual arithmetic or runtime errors and
+    # return a well-formed HTTP 500 response instead of an unhandled Lambda crash.
+    try:
+        allowed, metadata = rate_limiter.consume(
+            client_id=api_key,
+            client_tier=tier,
+            tokens_to_consume=1.0,
+            current_ts=current_ts
+        )
+    except Exception as exc:
+        logger.error(f"Unexpected error during rate-limit evaluation for {api_key}: {exc}", exc_info=True)
+        return {
+            "statusCode": 500,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"error": "Internal Server Error", "details": str(exc)})
+        }
 
     if not allowed:
         logger.warning(f"Rate limit exceeded for {api_key}. Rejecting with 429.")

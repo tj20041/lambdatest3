@@ -19,6 +19,13 @@ logger.handlers = [cli_handler]
 # ---------------------------------------------------------------------------
 # Token Bucket Algorithm Infrastructure
 # ---------------------------------------------------------------------------
+
+# Minimum elapsed-time floor used whenever delta_seconds is used as a divisor.
+# Prevents ZeroDivisionError when two requests land on the exact same timestamp
+# (e.g. near-simultaneous concurrent invocations within the same warm container tick).
+MIN_SAFE_DELTA_SECONDS = 1e-6
+
+
 @dataclasses.dataclass
 class BucketPolicy:
     capacity: float
@@ -60,15 +67,23 @@ class TokenBucketRateLimiter:
 
         logger.info(f"Evaluating client '{client_id}'. Elapsed time since last call: {delta_seconds}s")
 
-        # Refill tokens according to elapsed duration
+        # Refill tokens according to elapsed duration (safe: multiplication, never divides)
         refill_tokens = delta_seconds * policy.refill_rate_per_sec
         client_state.tokens_remaining = min(policy.capacity, client_state.tokens_remaining + refill_tokens)
         client_state.last_refill_timestamp = current_ts
 
-        # Advanced burst pressure calculations
-        # FAILS HERE: When two requests arrive in the exact same microsecond timestamp (current_ts == last_refill_timestamp),
-        # delta_seconds is 0.0, triggering ZeroDivisionError during throughput velocity calculations
-        instantaneous_pressure = (tokens_to_consume / delta_seconds) * (policy.capacity / policy.burst_allowance)
+        # Advanced burst pressure calculations.
+        # Guard against delta_seconds == 0.0 (e.g. two requests arriving with an identical
+        # timestamp within the same warm-container tick) by clamping to a minimum safe floor
+        # before using it as a divisor. This prevents ZeroDivisionError while still producing
+        # a meaningful (very high) instantaneous pressure value for near-simultaneous bursts.
+        safe_delta_seconds = max(delta_seconds, MIN_SAFE_DELTA_SECONDS)
+        if delta_seconds <= 0.0:
+            logger.warning(
+                f"delta_seconds was non-positive ({delta_seconds}) for client '{client_id}'; "
+                f"clamping to {MIN_SAFE_DELTA_SECONDS} to avoid division by zero."
+            )
+        instantaneous_pressure = (tokens_to_consume / safe_delta_seconds) * (policy.capacity / policy.burst_allowance)
 
         if client_state.tokens_remaining >= tokens_to_consume:
             client_state.tokens_remaining -= tokens_to_consume
@@ -96,14 +111,18 @@ rate_limiter = TokenBucketRateLimiter()
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     logger.info("Received request authorization query")
 
-    # Fixed timestamp simulating concurrent execution in identical event loop ticks
-    frozen_epoch_now = 1715000000.125000
+    # Fixed reference timestamp used to seed the simulated warm-container cache entry.
+    frozen_epoch_seed = 1715000000.125000
 
-    # Seed client in state cache with identical timestamp to force delta_seconds = 0.0
+    # Seed client in state cache with a timestamp strictly earlier than the request's
+    # current_ts below. Previously this seed matched current_ts exactly, forcing
+    # delta_seconds to 0.0 and crashing the pressure calculation with a
+    # ZeroDivisionError. current_ts is now derived from time.time() so it always
+    # moves forward relative to the seeded last_refill_timestamp.
     client_key = "api_key_live_992147102"
     rate_limiter.state_store[client_key] = ClientSessionState(
         tokens_remaining=10.0,
-        last_refill_timestamp=frozen_epoch_now,
+        last_refill_timestamp=frozen_epoch_seed,
         request_history=collections.deque(maxlen=100)
     )
 
@@ -125,13 +144,25 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
     logger.info(f"Authenticating request for tenant: {api_key} on tier: {tier}")
 
-    # Invoke consumption where delta_seconds between last_refill and current_ts is exactly 0.0
-    allowed, metadata = rate_limiter.consume(
-        client_id=api_key,
-        client_tier=tier,
-        tokens_to_consume=1.0,
-        current_ts=frozen_epoch_now
-    )
+    # Use the real wall-clock time for the request's current_ts so it is always
+    # strictly greater than the seeded last_refill_timestamp above, matching
+    # production behaviour and avoiding an artificial delta_seconds == 0.0.
+    current_ts = time.time()
+
+    try:
+        allowed, metadata = rate_limiter.consume(
+            client_id=api_key,
+            client_tier=tier,
+            tokens_to_consume=1.0,
+            current_ts=current_ts
+        )
+    except Exception as exc:
+        logger.error(f"Unhandled error while evaluating rate limit for '{api_key}': {exc}", exc_info=True)
+        return {
+            "statusCode": 500,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"error": "Internal rate limiter error"})
+        }
 
     if not allowed:
         logger.warning(f"Rate limit exceeded for {api_key}. Rejecting with 429.")

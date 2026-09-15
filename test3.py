@@ -37,6 +37,15 @@ TIER_POLICIES = {
     "TIER_ENTERPRISE": BucketPolicy(capacity=1000.0, refill_rate_per_sec=200.0, burst_allowance=100.0)
 }
 
+# Minimum elapsed-time floor used to avoid division-by-zero when two requests
+# resolve to an identical timestamp (coarse clock resolution / high concurrency
+# on a warm container). This treats a zero (or negative, due to clock skew)
+# delta as an infinitesimally small elapsed time rather than crashing, which
+# yields a defined (very high) instantaneous pressure value instead of an
+# unhandled exception.
+MIN_DELTA_SECONDS_FLOOR = sys.float_info.epsilon
+
+
 class TokenBucketRateLimiter:
     def __init__(self):
         # Emulating persistent warm-container state cache
@@ -60,15 +69,21 @@ class TokenBucketRateLimiter:
 
         logger.info(f"Evaluating client '{client_id}'. Elapsed time since last call: {delta_seconds}s")
 
-        # Refill tokens according to elapsed duration
-        refill_tokens = delta_seconds * policy.refill_rate_per_sec
+        # Refill tokens according to elapsed duration. Guard against negative
+        # deltas (clock skew) so we never subtract tokens during refill.
+        safe_refill_delta = delta_seconds if delta_seconds > 0 else 0.0
+        refill_tokens = safe_refill_delta * policy.refill_rate_per_sec
         client_state.tokens_remaining = min(policy.capacity, client_state.tokens_remaining + refill_tokens)
         client_state.last_refill_timestamp = current_ts
 
-        # Advanced burst pressure calculations
-        # FAILS HERE: When two requests arrive in the exact same microsecond timestamp (current_ts == last_refill_timestamp),
-        # delta_seconds is 0.0, triggering ZeroDivisionError during throughput velocity calculations
-        instantaneous_pressure = (tokens_to_consume / delta_seconds) * (policy.capacity / policy.burst_allowance)
+        # Advanced burst pressure calculations.
+        # FIX: When two requests arrive within the same timestamp resolution
+        # (delta_seconds <= 0), floor the denominator to a tiny epsilon value
+        # instead of dividing by zero. This preserves the intended semantics
+        # (near-zero elapsed time implies maximum/undefined instantaneous
+        # pressure) while eliminating the ZeroDivisionError crash.
+        effective_delta_seconds = delta_seconds if delta_seconds > 0 else MIN_DELTA_SECONDS_FLOOR
+        instantaneous_pressure = (tokens_to_consume / effective_delta_seconds) * (policy.capacity / policy.burst_allowance)
 
         if client_state.tokens_remaining >= tokens_to_consume:
             client_state.tokens_remaining -= tokens_to_consume
@@ -96,22 +111,18 @@ rate_limiter = TokenBucketRateLimiter()
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     logger.info("Received request authorization query")
 
-    # Fixed timestamp simulating concurrent execution in identical event loop ticks
-    frozen_epoch_now = 1715000000.125000
-
-    # Seed client in state cache with identical timestamp to force delta_seconds = 0.0
-    client_key = "api_key_live_992147102"
-    rate_limiter.state_store[client_key] = ClientSessionState(
-        tokens_remaining=10.0,
-        last_refill_timestamp=frozen_epoch_now,
-        request_history=collections.deque(maxlen=100)
-    )
+    # Use a real monotonic-ish wall clock timestamp per invocation instead of
+    # a hard-coded frozen value. The previous implementation deliberately
+    # seeded client state with a timestamp identical to the current_ts used
+    # in consume(), which guaranteed delta_seconds == 0.0 on every call and
+    # crashed the invocation. Real invocations must use a fresh timestamp.
+    current_ts = time.time()
 
     simulated_gateway_request = {
         "path": "/v1/market/quote",
         "httpMethod": "GET",
         "headers": {
-            "x-api-key": client_key,
+            "x-api-key": "api_key_live_992147102",
             "x-client-tier": "TIER_STANDARD"
         },
         "queryStringParameters": {
@@ -125,13 +136,31 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
     logger.info(f"Authenticating request for tenant: {api_key} on tier: {tier}")
 
-    # Invoke consumption where delta_seconds between last_refill and current_ts is exactly 0.0
-    allowed, metadata = rate_limiter.consume(
-        client_id=api_key,
-        client_tier=tier,
-        tokens_to_consume=1.0,
-        current_ts=frozen_epoch_now
-    )
+    # Defensive wrapper: even though consume() now guards against
+    # ZeroDivisionError internally, we still wrap the call so that any
+    # future/unforeseen exception in the rate-limiting path returns a
+    # graceful 503 response (with Retry-After guidance) rather than an
+    # unhandled Lambda invocation error surfaced to API Gateway callers.
+    try:
+        allowed, metadata = rate_limiter.consume(
+            client_id=api_key,
+            client_tier=tier,
+            tokens_to_consume=1.0,
+            current_ts=current_ts
+        )
+    except Exception:
+        logger.exception(f"Unhandled error while evaluating rate limit for {api_key}")
+        return {
+            "statusCode": 503,
+            "headers": {
+                "Content-Type": "application/json",
+                "Retry-After": "1"
+            },
+            "body": json.dumps({
+                "error": "Service Unavailable",
+                "details": "Rate limiter evaluation failed; please retry shortly."
+            })
+        }
 
     if not allowed:
         logger.warning(f"Rate limit exceeded for {api_key}. Rejecting with 429.")

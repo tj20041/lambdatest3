@@ -17,6 +17,14 @@ cli_handler.setFormatter(logging.Formatter("[RATE_LIMITER] [%(levelname)s] - %(m
 logger.handlers = [cli_handler]
 
 # ---------------------------------------------------------------------------
+# Sentinel constant used when instantaneous pressure cannot be calculated
+# (delta_seconds == 0.0 means simultaneous request; pressure is unbounded).
+# A large finite value is used instead of float('inf') to ensure the metadata
+# dict remains JSON-serialisable at all times.
+# ---------------------------------------------------------------------------
+PRESSURE_UNCALCULABLE: float = -1.0
+
+# ---------------------------------------------------------------------------
 # Token Bucket Algorithm Infrastructure
 # ---------------------------------------------------------------------------
 @dataclasses.dataclass
@@ -65,10 +73,22 @@ class TokenBucketRateLimiter:
         client_state.tokens_remaining = min(policy.capacity, client_state.tokens_remaining + refill_tokens)
         client_state.last_refill_timestamp = current_ts
 
-        # Advanced burst pressure calculations
-        # FAILS HERE: When two requests arrive in the exact same microsecond timestamp (current_ts == last_refill_timestamp),
-        # delta_seconds is 0.0, triggering ZeroDivisionError during throughput velocity calculations
-        instantaneous_pressure = (tokens_to_consume / delta_seconds) * (policy.capacity / policy.burst_allowance)
+        # Advanced burst pressure calculations.
+        # Guard against delta_seconds == 0.0 (simultaneous requests arriving within the same
+        # floating-point timestamp resolution, or on the very first call for a freshly seeded
+        # client).  Division by zero would otherwise crash the Lambda invocation entirely.
+        # When delta_seconds is zero, instantaneous throughput is theoretically unbounded;
+        # we represent this with the sentinel PRESSURE_UNCALCULABLE (-1.0) which is a finite,
+        # JSON-serialisable value that downstream consumers can detect and handle appropriately.
+        if delta_seconds > 0.0:
+            instantaneous_pressure = (tokens_to_consume / delta_seconds) * (policy.capacity / policy.burst_allowance)
+        else:
+            # Simultaneous request — burst pressure is unbounded; flag but do not crash.
+            instantaneous_pressure = PRESSURE_UNCALCULABLE
+            logger.warning(
+                f"delta_seconds is 0.0 for client '{client_id}'; "
+                "instantaneous_pressure set to sentinel PRESSURE_UNCALCULABLE (-1.0)."
+            )
 
         if client_state.tokens_remaining >= tokens_to_consume:
             client_state.tokens_remaining -= tokens_to_consume
@@ -96,16 +116,19 @@ rate_limiter = TokenBucketRateLimiter()
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     logger.info("Received request authorization query")
 
-    # Fixed timestamp simulating concurrent execution in identical event loop ticks
-    frozen_epoch_now = 1715000000.125000
+    # Use the current wall-clock time so that delta_seconds is naturally non-zero
+    # between the state initialisation in get_or_create_client() and subsequent calls.
+    # Previously a frozen timestamp was used both to seed the state store AND as
+    # current_ts, forcing delta_seconds = 0.0 on every single invocation.
+    frozen_epoch_now = time.time()
 
-    # Seed client in state cache with identical timestamp to force delta_seconds = 0.0
+    # Do NOT manually pre-seed the state store with the same timestamp that will be
+    # passed to consume().  Let get_or_create_client() initialise the session naturally
+    # on the first call.  The previous manual injection was the direct cause of the
+    # deterministic ZeroDivisionError: it set last_refill_timestamp=frozen_epoch_now
+    # and then immediately called consume() with current_ts=frozen_epoch_now, making
+    # delta_seconds exactly 0.0 on 100% of invocations.
     client_key = "api_key_live_992147102"
-    rate_limiter.state_store[client_key] = ClientSessionState(
-        tokens_remaining=10.0,
-        last_refill_timestamp=frozen_epoch_now,
-        request_history=collections.deque(maxlen=100)
-    )
 
     simulated_gateway_request = {
         "path": "/v1/market/quote",
@@ -125,13 +148,28 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
     logger.info(f"Authenticating request for tenant: {api_key} on tier: {tier}")
 
-    # Invoke consumption where delta_seconds between last_refill and current_ts is exactly 0.0
-    allowed, metadata = rate_limiter.consume(
-        client_id=api_key,
-        client_tier=tier,
-        tokens_to_consume=1.0,
-        current_ts=frozen_epoch_now
-    )
+    # Wrap the consume() call in a broad exception handler so that any unexpected
+    # arithmetic or state-access error returns a structured HTTP 500 JSON body
+    # rather than propagating an unhandled exception to the Lambda runtime and
+    # causing an opaque 500 with no response body for the API Gateway caller.
+    try:
+        allowed, metadata = rate_limiter.consume(
+            client_id=api_key,
+            client_tier=tier,
+            tokens_to_consume=1.0,
+            current_ts=frozen_epoch_now
+        )
+    except Exception as exc:
+        logger.error(
+            f"Rate limiter internal error for client '{api_key}' on tier '{tier}' "
+            f"at ts={frozen_epoch_now}: {exc}",
+            exc_info=True
+        )
+        return {
+            "statusCode": 500,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"error": "Internal rate limiter failure"})
+        }
 
     if not allowed:
         logger.warning(f"Rate limit exceeded for {api_key}. Rejecting with 429.")
